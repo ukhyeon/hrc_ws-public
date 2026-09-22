@@ -1,0 +1,848 @@
+import rclpy
+from rclpy.node import Node
+from hrc_interfaces.msg import HumanPose, HumanState, HumanDynamicsState, DirectionalMeffQuery, DirectionalMeffResult
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile
+from rclpy.qos import (
+    HistoryPolicy,
+    ReliabilityPolicy,
+    DurabilityPolicy
+)
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+import os
+import numpy as np
+import torch
+import time
+import json
+import yaml
+from .utils import batch_rodrigues, rotmat2euleryzx,rotmat2eulerzxy,rotmat2eulerzyx, batch_roteulerSMPL, wrap_to_pi_torch, load_rom_config_19, camera_to_world_rotmat
+from. import constants
+from .physcis import Physics, SMPL,SMPLH
+from .perf_logger import PerfCsvLogger
+
+
+class DynamicsNode(Node):
+    def __init__(self):
+        super().__init__('human_dynamics_node')
+
+        # Keep callbacks in separate groups so a slow 30 Hz dynamics update
+        # cannot starve new poses or directional meff query responses.
+        self.timer_group = MutuallyExclusiveCallbackGroup()
+        self.pose_group = MutuallyExclusiveCallbackGroup()
+        self.query_group = MutuallyExclusiveCallbackGroup()
+        
+        qos_profile = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE
+        )
+        self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        self._timing_events = None
+        if self.device.type == 'cuda':
+            self._timing_events = [
+                torch.cuda.Event(enable_timing=True)
+                for _ in range(8)
+            ]
+        
+        "Publisher"
+        self.pub = self.create_publisher(HumanState, '/hrc/human_state',1)
+        self.dynamics_pub = self.create_publisher(HumanDynamicsState, '/hrc/human_dynamics_state', qos_profile)
+        self.result_pub = self.create_publisher(DirectionalMeffResult,'/hrc/directional_meff_result', qos_profile)
+        self.worst_head_pub = self.create_publisher(
+            DirectionalMeffResult,
+            '/hrc/worst_head_meff',
+            qos_profile,
+        )
+
+        "Subscriber"
+        self.sub = self.create_subscription(
+            HumanPose,
+            '/hrc/human_pose',
+            self.pose_callback,
+            qos_profile,
+            callback_group=self.pose_group
+        )
+
+        self.query_sub = self.create_subscription(
+            DirectionalMeffQuery,
+            '/hrc/directional_meff_query',
+            self.query_callback,
+            qos_profile,
+            callback_group=self.query_group
+        )
+
+        "pose_callback 에서 받은 자세로 동역학 계산"
+        self.timer = self.create_timer(
+            1.0 / 30.0,
+            self.timer_callback,
+            callback_group=self.timer_group
+        )
+
+
+        "latest snapshot"
+        self.latest_meff_snapshot = None
+        self.latest_stamp = None
+        self.worst_head_query_counter = 0
+        
+        self.humanpose_msg =None
+        self.pose_torch_camera = None
+        self.betas = None
+        # self.full_pose_torch_world = None
+        self.pose_world = None
+        self.q= None
+        self.previous_q =None
+        self.previous_com_world = None
+        self.trans_torch_world = None
+        self.link_velocity = torch.zeros((1, 19, 3), dtype=torch.float32, device=self.device)
+
+        self.body_part_indices = list(range(19))
+        self.body_part_names = [
+            "pelvis",
+            "left_thigh",
+            "right_thigh",
+            "abdomen",
+            "left_calf",
+            "right_calf",
+            "left_foot",
+            "right_foot",
+            "chest",
+            "neck",
+            "left_shoulder",
+            "right_shoulder",
+            "head",
+            "left_upper_arm",
+            "right_upper_arm",
+            "left_lower_arm",
+            "right_lower_arm",
+            "left_hand",
+            "right_hand",
+        ]
+
+        "aa2euler 캐싱" 
+        self.full_pose_torch_world = torch.zeros((1, 72), dtype=torch.float32, device=self.device)
+        # 좌표 변환, 거리 계측
+        self.cam_R = camera_to_world_rotmat(roll=110.8, pitch=0, yaw=0, device=self.device).to(dtype=torch.float32).unsqueeze(0)
+        self.t_cam_to_world = torch.tensor([-0.80, -2.3, 1.55], dtype=torch.float32, device=self.device) # 뒷 테이프 - 0.73 
+        self.euler_keep_idx = torch.tensor([i for i in range(22) if i not in (9, 10)], device=self.device)
+        self.idx_smpl_ordered = [0, 1, 2, 3, 4, 5, 7, 8, 6, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+        self.idx_smpl_ordered_torch = torch.tensor(
+            self.idx_smpl_ordered,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        self.mass_19_body = None
+        self.inertia_19_body = None
+        self.rest_joints_19 = None
+        self.rest_joint_offsets_19 = None
+        self.com_local_offsets_19 = None
+        self.first_cal_inertia_mass =True
+        self.has_new_pose =False
+
+        self.u_dummy = torch.zeros((1, 19, 3), device= self.device)
+
+        self.physics = Physics(device= self.device)
+        self.smpl = SMPL(device=self.device)
+        self.smplh = SMPLH(gender="male", device=self.device)
+
+        self.find_worst_vis_enabled = False
+        self.find_worst_num_directions = 64
+        self.find_worst_target_index = 12
+        try:
+            config_path = "/home/robotics/hrc_ws/src/hrc_body_tracking/server/renat.yaml"
+            with open(config_path, "r") as f:
+                vis_cfg = yaml.safe_load(f)["aggregate"]["vis_pose"]
+            self.find_worst_vis_enabled = bool(
+                vis_cfg.get("find_worst_vis", False)
+            )
+            self.find_worst_target_index = int(
+                vis_cfg.get("find_worst_target_index", 12)
+            )
+            self.find_worst_num_directions = int(
+                vis_cfg.get("find_worst_num_directions", 64)
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f"Failed to load find_worst_vis config; disabled: {e}"
+            )
+        
+        self.keep_idx = torch.tensor(
+            [i for i in range(24) if i not in (9,10)],
+            device=self.device
+        )
+
+        self.merge_joint_map = {
+            0: [0],        # pelvis
+            1: [1],        # L_hip
+            2: [2],        # R_hip
+            3: [3],        # spine1
+            4: [4],        # L_knee
+            5: [5],        # R_knee
+            6: [7, 10],    # L_ankle + L_foot
+            7: [8, 11],    # R_ankle + R_foot
+            8: [6,9],      # spine 2 + spine3
+            9: [12],       # neck
+            10: [13],      # L_collar
+            11: [14],      # R_collar
+            12: [15],      # head
+            13: [16],      # L_shoulder
+            14: [17],      # R_shoulder
+            15: [18],      # L_elbow
+            16: [19],      # R_elbow
+            17: [20, 22],  # L_wrist + L_hand
+            18: [21, 23],  # R_wrist + R_hand
+        }
+        self.rom_cfg = load_rom_config_19(json_path="/home/robotics/python/physpt/models/joint_ROM.json")
+
+        self.enable_meff_query_debug = self.declare_parameter(
+            "enable_meff_query_debug",
+            False,
+        ).value
+        self.meff_query_debug_path = None
+        if self.enable_meff_query_debug:
+            meff_debug_dir = "/home/robotics/hrc_ws/debug_log"
+            os.makedirs(meff_debug_dir, exist_ok=True)
+            self.meff_query_debug_path = os.path.join(
+                meff_debug_dir,
+                "human_directional_meff_query_debug.jsonl",
+            )
+            self.get_logger().info(
+                "[meff debug] saving query debug log to: "
+                f"{self.meff_query_debug_path}"
+            )
+        self.perf_update_logger = PerfCsvLogger(
+            "/home/robotics/hrc_ws/analysis/realtime_perf/"
+            "paper_human_dynamics_perf.csv",
+            [
+                "t_ros_sec",
+                "rotation_conversion_ms",
+                "rotation_matrix_ms",
+                "rigid_fk_com_ms",
+                "jacobian_ms",
+                "mass_matrix_ms",
+                "state_publish_prep_ms",
+                "publish_ms",
+                "total_operation_ms",
+                "nominal_deadline_ms",
+                "deadline_miss",
+            ],
+            flush_every=30,
+        )
+        self.perf_query_logger = PerfCsvLogger(
+            "/home/robotics/hrc_ws/analysis/realtime_perf/"
+            "paper_human_meff_query_perf.csv",
+            [
+                "t_ros_sec",
+                "query_id",
+                "target_index",
+                "query_compute_ms",
+                "valid",
+            ],
+            flush_every=30,
+        )
+
+    def _get_body_part_name(self, target_index: int) -> str:
+        if target_index == 15:
+            return "left_upper_arm"
+        if 0 <= target_index < len(self.body_part_names):
+            return self.body_part_names[target_index]
+        return "invalid"
+
+    def q24_to_q19(self,q):
+        q_19 = self.q24_to_q19_body(q)
+        q_19 = q_19[:, constants.smpl2q_19] # q type
+        pose_19_euler_rad = q_19[:,3:]
+        pose_19_euler_rad = pose_19_euler_rad.reshape(-1,19,3)
+
+        return pose_19_euler_rad
+
+    def q24_to_q19_body(self, q):
+        q_19_list = [q[:,:3]]
+        for new_idx, olds in self.merge_joint_map.items():
+            j_rep = olds[0]  # 대표로 쓸 joint index 8: [6,9] 이면 6이 대표 조인트
+
+            base = 3 + 3 * j_rep          # 이 조인트의 첫 축 인덱스
+            cols = slice(base, base + 3)  # (base, base+1, base+2)
+
+            # 대표 조인트의 회전 3축만 그대로 사용 (평균 X)
+            q_19_list.append(q[:, cols])           # (T, 3)
+        return torch.cat(q_19_list, dim=1)
+
+    def rigid_fk_19(self, world_rot):
+        batch_size = world_rot.shape[0]
+        joints_19 = torch.zeros(
+            (batch_size, 19, 3),
+            dtype=world_rot.dtype,
+            device=world_rot.device,
+        )
+        joints_19[:, 0] = self.rest_joints_19[:, 0]
+
+        for joint_idx in self.physics._smpl19_topo_order:
+            parent_idx = self.physics._smpl19_parent[joint_idx]
+            if parent_idx < 0:
+                continue
+            offset_world = torch.einsum(
+                "bij,bj->bi",
+                world_rot[:, parent_idx],
+                self.rest_joint_offsets_19[:, joint_idx],
+            )
+            joints_19[:, joint_idx] = joints_19[:, parent_idx] + offset_world
+
+        return joints_19 + self.trans_torch_world[:, None, :]
+        
+
+
+    @torch.inference_mode()
+    def timer_callback(self):
+
+        if not self.has_new_pose:
+            return 
+        
+        if self.betas is None or self.pose_torch_camera is None:
+            return
+    
+        if self.inertia_19_body is None:
+            self.mass_inertia() # 기본 자세에서 mass와 inertia 계산
+        
+        if self.pose_torch_camera != None:
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()
+            wall_start = time.perf_counter()
+            t0 = self._timing_marker(0)
+            self.pose_world, self.trans_torch_world = self.aa2euler() # camera 좌표계 axis anglg 를 world 좌표계 euler 로 변환
+            t1 = self._timing_marker(1)
+            # self.full_pose_torch_world = torch.zeros([1, 72]).type(torch.float32).to(self.device)
+            self.full_pose_torch_world.zero_()
+            self.full_pose_torch_world[:, constants.G2Hpose_idx] = self.pose_world # wolrd 좌표계로 변환된 값
+
+            # self.get_logger().info(f" trans : {self.trans_torch.shape} \n pose : {self.full_pose_torch_world.shape}")
+            rotmat_world, rotmat_individual_world = batch_roteulerSMPL(self.full_pose_torch_world)
+            t2 = self._timing_marker(2)
+
+            self.q = torch.cat((self.trans_torch_world, self.full_pose_torch_world), dim=1) # 1, 75
+            pose_19_euler_rad = self.q24_to_q19(self.q)
+            pose_19_euler_deg = torch.rad2deg(pose_19_euler_rad)
+
+            analytic_Jr_19, world_rot = self.physics.compute_Jr_19_smpl(rotmat_individual_world)
+            joints_19_world = self.rigid_fk_19(world_rot)
+            com_offset_world = torch.einsum(
+                "nbij,nbj->nbi",
+                world_rot,
+                self.com_local_offsets_19.expand(world_rot.shape[0], -1, -1),
+            )
+            com_world = joints_19_world + com_offset_world
+            t3 = self._timing_marker(3)
+
+            world_inerita = torch.einsum('nbij,nbjk,nbkm->nbim', world_rot, self.inertia_19_body, world_rot.transpose(2, 3))
+            analytic_Jp_19 = self.physics.compute_J_p_19(com_world, joints_19_world, analytic_Jr_19) # qtype
+            t4 = self._timing_marker(4)
+
+            Mq_angular_19 = torch.einsum('nbij,nbjk,nbkm->nbim', analytic_Jr_19.transpose(2, 3), world_inerita, analytic_Jr_19) # 그냥 inertia 를 사용ss
+            Mq_linear_19 = torch.einsum('nbij,nbjk->nbik', analytic_Jp_19.transpose(2, 3), analytic_Jp_19) * self.mass_19_body[:, :, None, None]
+            Mq_19 = Mq_linear_19.sum(1) + Mq_angular_19.sum(1)
+            Minv_contact, structural_locked_cols = (
+                self.physics.prepare_meff_constrained_common(
+                    Mq=Mq_19,
+                    J_p=analytic_Jp_19,
+                    rom_cfg=self.rom_cfg,
+                    contact_J_index=[6, 7],
+                    always_lock_joints=(10, 11),
+                )
+            )
+            t5 = self._timing_marker(5)
+          
+            if self.previous_q is not None:
+                q_dot_19_body = self.calculate_vel_19_body()
+                self.link_velocity = torch.einsum(
+                    "nbij,nj->nbi",
+                    analytic_Jp_19,
+                    q_dot_19_body,
+                )
+            else:
+                self.link_velocity.zero_()
+
+            "msg 2: collision assessment 에게 19 bodypart com 위치와 속도 topic"
+            dyn_msg = HumanDynamicsState()
+            dyn_msg.header.stamp = self.get_clock().now().to_msg()
+            dyn_msg.header.frame_id = "world"
+
+            dyn_msg.body_part_indices = self.body_part_indices
+            dyn_msg.body_part_names = self.body_part_names
+            dyn_msg.body_part_positions = com_world.detach().cpu().reshape(-1).tolist()
+            dyn_msg.body_part_velocities = self.link_velocity.detach().cpu().reshape(-1).tolist()
+
+            t6 = self._timing_marker(6)
+            self.dynamics_pub.publish(dyn_msg)
+            t7 = self._timing_marker(7)
+
+            if self.device.type == 'cuda':
+                t7.synchronize()
+
+            self.latest_meff_snapshot = (
+                Minv_contact.detach(),
+                structural_locked_cols,
+                analytic_Jp_19.detach(),
+                analytic_Jr_19.detach(),
+                pose_19_euler_deg.detach(),
+            )
+            self.latest_stamp = self.get_clock().now().to_msg()
+
+            if self.find_worst_vis_enabled:
+                self.publish_worst_target_meff_direction(
+                    Minv_contact=Minv_contact.detach(),
+                    structural_locked_cols=structural_locked_cols,
+                    Jp_19=analytic_Jp_19.detach(),
+                    Jr_19=analytic_Jr_19.detach(),
+                    pose_19_euler_deg=pose_19_euler_deg.detach(),
+                )
+
+            total_ms = (time.perf_counter() - wall_start) * 1000
+
+            timings = {
+                "AA2Euler": self._elapsed_ms(t0, t1),
+                "Rotation": self._elapsed_ms(t1, t2),
+                "RigidFK_COM": self._elapsed_ms(t2, t3),
+                "Jacobian": self._elapsed_ms(t3, t4),
+                "MassMatrix": self._elapsed_ms(t4, t5),
+                "StatePrep": self._elapsed_ms(t5, t6),
+                "Topic_pub": self._elapsed_ms(t6, t7),
+                "Total": total_ms,
+            }
+            # 병목 확인
+            # log_str = " | ".join(
+            #     [f"{name}: {elapsed_ms:.1f}ms" for name, elapsed_ms in timings.items()]
+            # )
+            # self.get_logger().info(log_str)
+
+
+            self.perf_update_logger.write(
+                t_ros_sec=f"{self.get_clock().now().nanoseconds / 1e9:.9f}",
+                rotation_conversion_ms=f"{timings['AA2Euler']:.6f}",
+                rotation_matrix_ms=f"{timings['Rotation']:.6f}",
+                rigid_fk_com_ms=f"{timings['RigidFK_COM']:.6f}",
+                jacobian_ms=f"{timings['Jacobian']:.6f}",
+                mass_matrix_ms=f"{timings['MassMatrix']:.6f}",
+                state_publish_prep_ms=f"{timings['StatePrep']:.6f}",
+                publish_ms=f"{timings['Topic_pub']:.6f}",
+                total_operation_ms=f"{timings['Total']:.6f}",
+                nominal_deadline_ms=f"{1000.0 / 30.0:.6f}",
+                deadline_miss=int(timings["Total"] > (1000.0 / 30.0)),
+            )
+
+            self.previous_q = self.q
+            self.previous_com_world = com_world
+            # self.get_logger().info(f" head eff : {Meff_all[0,12]:.1f}")
+
+    def publish_worst_target_meff_direction(
+        self,
+        Minv_contact,
+        structural_locked_cols,
+        Jp_19,
+        Jr_19,
+        pose_19_euler_deg,
+    ):
+        try:
+            meff, direction, _, _ = (
+                self.physics.find_worst_meff_direction_constrained_from_common(
+                    Minv_contact=Minv_contact,
+                    structural_locked_cols=structural_locked_cols,
+                    J_p=Jp_19,
+                    J_r=Jr_19,
+                    pose_19_euler_deg=pose_19_euler_deg,
+                    rom_cfg=self.rom_cfg,
+                    j_eval=self.find_worst_target_index,
+                    num_directions=self.find_worst_num_directions,
+                    tol_deg=5.0,
+                    meff_offset=2.0,
+                )
+            )
+
+            direction_np = (
+                direction.detach()
+                .cpu()
+                .reshape(-1)
+                .numpy()
+                .astype(np.float32)
+            )
+            norm = float(np.linalg.norm(direction_np))
+            if norm < 1e-8:
+                return
+            direction_np = direction_np / norm
+
+            msg = DirectionalMeffResult()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "world"
+            msg.query_id = self.worst_head_query_counter
+            msg.target_index = self.find_worst_target_index
+            msg.direction_u.x = float(direction_np[0])
+            msg.direction_u.y = float(direction_np[1])
+            msg.direction_u.z = float(direction_np[2])
+            msg.directional_meff = float(meff.detach().cpu().item())
+            msg.valid = True
+            msg.compute_time_ms = 0.0
+            self.worst_head_pub.publish(msg)
+            self.worst_head_query_counter += 1
+        except Exception as e:
+            self.get_logger().warn(f"Failed to publish worst M_eff direction: {e}")
+
+   
+
+    def calculate_vel(self):
+        q_trans_dot = (self.q[:,:3] - self.previous_q[:,:3]) / constants.dt
+        q_pose_dot = wrap_to_pi_torch(self.q[:,3:] - self.previous_q[:, 3:]) / constants.dt
+        q_dot = torch.cat((q_trans_dot,q_pose_dot),dim=1) # 1 , 60
+           
+        return q_dot
+
+    def calculate_vel_19_body(self):
+        q_19_body = self.q24_to_q19_body(self.q)
+        previous_q_19_body = self.q24_to_q19_body(self.previous_q)
+        q_trans_dot = (
+            q_19_body[:, :3] - previous_q_19_body[:, :3]
+        ) / constants.dt
+        q_pose_dot = wrap_to_pi_torch(
+            q_19_body[:, 3:] - previous_q_19_body[:, 3:]
+        ) / constants.dt
+        return torch.cat((q_trans_dot, q_pose_dot), dim=1)
+
+
+    def _timing_marker(self, index):
+        if self.device.type == 'cuda':
+            event = self._timing_events[index]
+            event.record()
+            return event
+        return time.perf_counter()
+
+    def _elapsed_ms(self, start, end):
+        if self.device.type == 'cuda':
+            return start.elapsed_time(end)
+        return (end - start) * 1000
+    
+    @torch.inference_mode()
+    def mass_inertia(self):
+        "기존 방법과 동일 검증"
+        pose_zeros = torch.zeros((1,72),dtype=torch.float32,device=self.device)
+        rotmat_zeros, rotmat_individual = batch_roteulerSMPL(pose_zeros)
+        output_smpl_body_frame = self.smplh.forward(betas=self.betas, rotmat= rotmat_zeros)
+        vertices_body = output_smpl_body_frame.vertices
+        joints_smpl_body = output_smpl_body_frame.joints_smpl
+        mass_24_body, volume_24_body, inertia_24_body, centroid_24_body = self.physics.compute_massinertia(vertices_body, joints_smpl_body)
+        mass_19_body, _, inertia_19_body, centorid_19_body = self.physics.merge_parts_24_to_19_vertex_avg(mass_24_body, volume_24_body,
+                                                                                            inertia_24_body, centroid_24_body)
+        self.inertia_19_body = inertia_19_body
+        self.mass_19_body = mass_19_body
+        self.rest_joints_19 = output_smpl_body_frame.joint_smpl_shaped[
+            :, self.idx_smpl_ordered_torch, :
+        ]
+        self.rest_joint_offsets_19 = torch.zeros_like(self.rest_joints_19)
+        for joint_idx in self.physics._smpl19_topo_order:
+            parent_idx = self.physics._smpl19_parent[joint_idx]
+            if parent_idx < 0:
+                continue
+            self.rest_joint_offsets_19[:, joint_idx] = (
+                self.rest_joints_19[:, joint_idx]
+                - self.rest_joints_19[:, parent_idx]
+            )
+        self.com_local_offsets_19 = (
+            centorid_19_body - self.rest_joints_19
+        )
+
+
+    def pose_callback(self, msg: HumanPose):
+        "smplh 에 맞게 수정 "
+
+        self.humanpose_msg = msg
+        pose_np_camera = np.array(self.humanpose_msg.body_full_pose, dtype=np.float32)
+        trans_camera = np.array(self.humanpose_msg.global_trans, dtype=np.float32)
+        betas = np.array(self.humanpose_msg.smpl_betas, dtype=np.float32) 
+        pose_torch_camera = torch.from_numpy(pose_np_camera).type(torch.float32).to(self.device)
+        trans_torch_cameara = torch.from_numpy(trans_camera).type(torch.float32).to(self.device)
+        betas_torch = torch.from_numpy(betas).type(torch.float32).to(self.device)
+        # 배치 단위 확장
+        self.pose_torch_camera = pose_torch_camera.unsqueeze(0) 
+        self.trans_torch_camera = trans_torch_cameara.unsqueeze(0)
+        self.betas = betas_torch.unsqueeze(0) # 1, 10
+
+        self.has_new_pose = True
+
+        """
+        최종 shpae은 배치 차원 추가
+        pose : 1, 66
+        trans : 1, 3 
+        """
+
+    def aa2euler(self):
+        "비실시간에서 AMASS_from_k4a.py 역할을 해야 함"
+        "sensing_node.py 에서 카메라 좌표계로 저장된 pose 값을 world 기준으로 변환 "
+        # 4ms
+        # torch.cuda.synchronize()
+
+        start_time = time.perf_counter()
+        rotmat = batch_rodrigues(self.pose_torch_camera.view(-1,1,3)).view(-1,22,3,3)
+        
+        '좌표계 변환 '
+        # 카메라 좌표계 -> world 좌표계
+        # cam_R = camera_to_world_rotmat(roll=90,pitch= 0,yaw= 0,device=self.device).unsqueeze(0)
+        # t_cam_to_world = torch.tensor([-0.4, -3.4, 1.55], dtype=torch.float32, device=self.device) # world 기준 카메라의 위치
+        cam_R = self.cam_R
+        t_cam_to_world = self.t_cam_to_world
+
+        # root rotation만 world 기준으로 변환
+        rotmat_world = rotmat.clone()
+        rotmat_world[:, 0] = cam_R.transpose(1, 2) @ rotmat_world[:, 0]
+        trans_torch_world = torch.bmm(cam_R.transpose(1,2), self.trans_torch_camera.unsqueeze(-1)).squeeze(-1) + t_cam_to_world
+        
+      
+        'axis angle - > euler'
+        # torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start_time) * 1000 # 0.5 ms
+        # print(f"aa -> rotmat time  per frame : {elapsed:.1f}ms")
+
+        euler_root = rotmat2euleryzx(rotmat_world[:,:1,:,:].view(-1,3,3)).view(-1,1,3) # [N,1,3,3] -> [N*1,3,3] -> [N*3,1,3]
+        euler_s = rotmat2eulerzyx(rotmat_world[:,1:16,:,:].view(-1,3,3)).view(-1,15,3) # 1~16 번 관절
+        euler_shoulder = rotmat2eulerzxy(rotmat_world[:,16:18,:,:].view(-1,3,3)).view(-1,2,3) # 16~18번 관절
+        euler_elbow = rotmat2euleryzx(rotmat_world[:,18:20,:,:].view(-1,3,3)).view(-1,2,3) # 18~20 번 관절
+        euler_e = rotmat2eulerzyx(rotmat_world[:,20:22,:,:].view(-1,3,3)).view(-1,2,3) # 20~22번 관절
+
+        euler = torch.cat((euler_root,euler_s,euler_shoulder,euler_elbow,euler_e), dim=1) # 관절차원으로 결합, (N, 24, 3)
+        # euler = euler[:, torch.tensor([i for i in range(euler.shape[1]) if i not in (9, 10)], device=euler.device), :].reshape(euler.shape[0], -1)
+        euler = euler[:, self.euler_keep_idx, :].reshape(euler.shape[0], -1) # euler = np.delete(euler, [9,10], 1).reshape([-1,20*3]) 와 같은 역할
+
+        euler = torch.remainder(euler, 2* torch.pi)
+        euler[euler >torch.pi] -= 2* torch.pi
+        # print(f" euler shape : {euler.shape}") # 1, 60
+
+        # torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start_time) * 1000
+        # print(f"rotmat -> euler time  per frame : {elapsed:.1f}ms")
+        return euler, trans_torch_world
+    
+    def save_directional_meff_query_debug(
+        self,
+        msg: DirectionalMeffQuery,
+        target_index: int,
+        u_raw_np: np.ndarray,
+        u_norm_torch: torch.Tensor,
+        meff_value: float,
+        valid: bool = True,
+        error_msg: str = ""
+    ):
+        """
+        Save minimal directional effective mass query debug data.
+
+        Output example:
+        {
+            "target_index": 12,
+            "target_name": "head",
+            "u": [ux, uy, uz],
+            "meff": 2.83
+        }
+        """
+
+        if not self.enable_meff_query_debug:
+            return
+
+        try:
+            # normalized u: shape (1, 1, 3) -> (3,)
+            u_norm_np = (
+                u_norm_torch.detach()
+                .cpu()
+                .reshape(-1)
+                .numpy()
+                .astype(float)
+            )
+
+            if 0 <= target_index < len(self.body_part_names):
+                target_name = self._get_body_part_name(target_index)
+            else:
+                target_name = "invalid"
+
+            record = {
+                "target_index": int(target_index),
+                "target_name": str(target_name),
+                "u": [
+                    float(u_norm_np[0]),
+                    float(u_norm_np[1]),
+                    float(u_norm_np[2]),
+                ],
+                "meff": float(meff_value),
+            }
+
+            # 실패 query도 보고 싶으면 valid/error_msg만 추가
+            if not valid:
+                record["valid"] = False
+                record["error_msg"] = str(error_msg)
+
+            with open(self.meff_query_debug_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            # 유효질량 확인
+            # self.get_logger().info(
+            #     f"[meff debug] saved: "
+            #     f"target={target_index}:{target_name}, "
+            #     f"u=[{u_norm_np[0]:.3f}, {u_norm_np[1]:.3f}, {u_norm_np[2]:.3f}], "
+            #     f"meff={meff_value:.3f} kg"
+            # )
+
+        except Exception as e:
+            self.get_logger().warn(
+                f"[meff debug] failed to save query debug log: {e}"
+            )
+    
+    @torch.inference_mode()
+    def query_callback(self, msg: DirectionalMeffQuery):
+        query_start = time.perf_counter()
+
+        snapshot = self.latest_meff_snapshot
+        if snapshot is None:
+            self.get_logger().warn("Directional meff query received before dynamics snapshot is ready")
+            return
+
+        target_index = int(msg.target_index)
+
+        if target_index < 0 or target_index >= 19:
+            self.get_logger().warn(f"Invalid human target_index: {target_index}")
+            return
+
+        (
+            Minv_contact,
+            structural_locked_cols,
+            Jp_19,
+            Jr_19,
+            pose_19_euler_deg,
+        ) = snapshot
+
+        # 단일 target에 대한 direction vector
+        u = np.array([
+            msg.direction_u.x,
+            msg.direction_u.y,
+            msg.direction_u.z
+        ], dtype=np.float32)
+
+        u_torch = torch.from_numpy(u).to(self.device).view(1, 1, 3)
+        u_torch = u_torch / (torch.norm(u_torch, dim=-1, keepdim=True) + 1e-8)
+
+        # 기존 physics 함수가 (1,19,3)을 기대하므로 target 위치에만 direction을 채움
+        u_full = torch.zeros((1, 19, 3), dtype=torch.float32, device=self.device)
+        u_full[:, target_index, :] = u_torch[:, 0, :]
+
+        try:
+            meff_target, _ = self.physics.compute_meff_constrained_from_common(
+                Minv_contact=Minv_contact,
+                structural_locked_cols=structural_locked_cols,
+                J_p=Jp_19,
+                J_r=Jr_19,
+                u=u_full,
+                pose_19_euler_deg=pose_19_euler_deg,
+                rom_cfg=self.rom_cfg,
+                j_eval=target_index,
+                tol_deg=5.0,
+                return_debug=False,
+            )
+            meff_target +=2
+
+            meff_value = float(meff_target.reshape(-1)[0].item())
+
+            result = DirectionalMeffResult()
+            result.header.stamp = self.get_clock().now().to_msg()
+            result.header.frame_id = "world"
+            result.query_id = msg.query_id
+            result.target_index = msg.target_index
+            result.direction_u.x = float(u_torch.reshape(-1)[0].item())
+            result.direction_u.y = float(u_torch.reshape(-1)[1].item())
+            result.direction_u.z = float(u_torch.reshape(-1)[2].item())
+            result.valid = True
+            result.directional_meff = meff_value
+
+            if self.enable_meff_query_debug:
+                self.save_directional_meff_query_debug(
+                    msg=msg,
+                    target_index=target_index,
+                    u_raw_np=u,
+                    u_norm_torch=u_torch,
+                    meff_value=meff_value,
+                    valid=True,
+                    error_msg=""
+                )
+
+            query_ms = (time.perf_counter() - query_start) * 1000
+            result.compute_time_ms = query_ms
+            self.result_pub.publish(result)
+            self.perf_query_logger.write(
+                t_ros_sec=f"{self.get_clock().now().nanoseconds / 1e9:.9f}",
+                query_id=msg.query_id,
+                target_index=target_index,
+                query_compute_ms=f"{query_ms:.6f}",
+                valid=1,
+            )
+
+
+
+        except Exception as e:
+            self.get_logger().error(
+                f"Failed to compute directional meff for query_id={msg.query_id}, "
+                f"target_index={target_index}: {e}"
+            )
+            if self.enable_meff_query_debug:
+                try:
+                    self.save_directional_meff_query_debug(
+                        msg=msg,
+                        target_index=target_index,
+                        u_raw_np=u,
+                        u_norm_torch=u_torch,
+                        meff_value=0.0,
+                        valid=False,
+                        error_msg=str(e)
+                    )
+                except Exception:
+                    pass
+
+            result = DirectionalMeffResult()
+            result.header.stamp = self.get_clock().now().to_msg()
+            result.header.frame_id = "world"
+            result.query_id = msg.query_id
+            result.target_index = msg.target_index
+            result.direction_u.x = float(u_torch.reshape(-1)[0].item())
+            result.direction_u.y = float(u_torch.reshape(-1)[1].item())
+            result.direction_u.z = float(u_torch.reshape(-1)[2].item())
+            result.valid = False
+            result.directional_meff = 0.0
+            query_ms = (time.perf_counter() - query_start) * 1000
+            result.compute_time_ms = query_ms
+            self.result_pub.publish(result)
+            self.perf_query_logger.write(
+                t_ros_sec=f"{self.get_clock().now().nanoseconds / 1e9:.9f}",
+                query_id=msg.query_id,
+                target_index=target_index,
+                query_compute_ms=f"{query_ms:.6f}",
+                valid=0,
+            )
+        
+
+    def destroy_node(self):
+        self.perf_update_logger.close()
+        self.perf_query_logger.close()
+        return super().destroy_node()
+
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DynamicsNode()
+
+    executor = MultiThreadedExecutor(num_threads=3)
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ =='__main__':
+    main

@@ -1,0 +1,5 @@
+std_msgs/Header header
+
+uint64 assessment_id
+builtin_interfaces/Time assessment_start_stamp
+float32 speed_scale
