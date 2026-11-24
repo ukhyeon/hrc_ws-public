@@ -4,7 +4,7 @@
   <name>hrc_body_tracking</name>
   <version>0.0.0</version>
   <description>Human sensing, 3D pose estimation, dynamics estimation, and collision visualization for human-robot collaboration.</description>
-  <maintainer email="treyu1231@naver.com">robotics</maintainer>
+  <maintainer email="169152093+ukhyeon@users.noreply.github.com">ukhyeon</maintainer>
   <license>Apache-2.0</license>
   <license>MIT</license>
 

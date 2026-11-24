@@ -113,7 +113,7 @@ class DynamicsNode(Node):
             17: [20, 22],  # L_wrist + L_hand
             18: [21, 23],  # R_wrist + R_hand
         }
-        self.rom_cfg = load_rom_config_19(json_path="/home/robotics/hrc_ws/src/body_models/joint_rom/joint_ROM.json")
+        self.rom_cfg = load_rom_config_19(json_path=os.path.join(os.path.expanduser(os.environ.get("HRC_WS_DIR", "~/hrc_ws")), "src/body_models/joint_rom/joint_ROM.json"))
 
     def q24_to_q19(self,q):
         q_19_list = [q[:,:3]]

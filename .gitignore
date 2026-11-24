@@ -44,3 +44,23 @@ __pycache__
 
 src/hrc_body_tracking/hrc_body_tracking/models/.DS_Store
 src/hrc_body_tracking/hrc_body_tracking/models/cliff_hr48/.DS_Store
+
+# ---- sync with hrc_ws (2026-11-24) ----
+# joint range-of-motion limits used by human_dynamics (includes ankle ranges)
+!src/body_models/joint_rom/joint_ROM.json
+# ISO/TS 15066 body-region table used by sensing_node
+!src/hrc_body_tracking/server/iso_15066.json
+# pinned Python runtime packages (SETUP.md 6.1)
+!/requirements.txt
+!/requirements-torch-*.txt
+# chumpy import fix (SETUP.md 6.1)
+!/tools/patch_chumpy.sh
+# ament resource marker (empty file) required by setup.py data_files; the generic resource/ rule above would drop it
+!src/hrc_body_tracking/resource/
+# runtime debug output (camera pose measurements, meff query debug, ...)
+/debug_log/
+# editor/manual backup copies
+*.bak
+# Azure Kinect SDK / BT packages (Microsoft EULA, never commit; SETUP.md 2.1)
+*.deb
+# body models and weights (SMPL-family, PhysPT neutral.pkl, CLIFF) are never committed; see SETUP.md 7

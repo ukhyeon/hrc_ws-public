@@ -10,6 +10,7 @@ import torch
 
 
 from .utils import batch_global_rigid_transformation
+from .paths import ws
 
 
 
@@ -18,11 +19,11 @@ ModelOutput = namedtuple('ModelOutput',
                           ])
 ModelOutput.__new__.__defaults__ = (None,) * len(ModelOutput._fields)
 
-# SMPL_MODEL_PATH = '/home/robotics/hrc_ws/src/body_models/smpl/SMPL_NEUTRAL.pkl'
-SMPL_MODEL_PATH = '/home/robotics/python/physpt/assets/data/smpl/neutral.pkl'
-SMPLH_M_PATH = "/home/robotics/hrc_ws/src/body_models/smplh/male.npz"
-SMPLH_F_PATH = "/home/robotics/hrc_ws/src/body_models/smplh/female.npz"
-SMPLH_N_PATH = "/home/robotics/hrc_ws/src/body_models/smplh/neutral.npz"
+# SMPL_MODEL_PATH = ws('src/body_models/smpl/SMPL_NEUTRAL.pkl')
+SMPL_MODEL_PATH = ws('src/body_models/smpl/neutral.pkl')  # PhysPT-processed SMPL neutral (see README)
+SMPLH_M_PATH = ws("src/body_models/smplh/male.npz")
+SMPLH_F_PATH = ws("src/body_models/smplh/female.npz")
+SMPLH_N_PATH = ws("src/body_models/smplh/neutral.npz")
 
 
 
@@ -814,7 +815,7 @@ class Physics:
         
         self.device = device if device is not None else torch.device('cpu')
 
-        PHYSICS_PATH = '/home/robotics/hrc_ws/src/hrc_body_tracking/server/physics.pkl'
+        PHYSICS_PATH = ws('src/hrc_body_tracking/server/physics.pkl')
         # physics
         with open(PHYSICS_PATH, 'rb') as f:
             physics_data = pickle.load(f)

@@ -20,6 +20,9 @@ from .utils import batch_rodrigues, rotmat2euleryzx,rotmat2eulerzxy,rotmat2euler
 from. import constants
 from .physcis import Physics, SMPL,SMPLH
 from .perf_logger import PerfCsvLogger
+from .paths import ws
+from std_msgs.msg import String
+from .camera_pose import CAMERA_POSE_TOPIC, camera_pose_qos, parse_pose_message
 
 
 class DynamicsNode(Node):
@@ -123,8 +126,18 @@ class DynamicsNode(Node):
         "aa2euler 캐싱" 
         self.full_pose_torch_world = torch.zeros((1, 72), dtype=torch.float32, device=self.device)
         # 좌표 변환, 거리 계측
-        self.cam_R = camera_to_world_rotmat(roll=110.8, pitch=0, yaw=0, device=self.device).to(dtype=torch.float32).unsqueeze(0)
-        self.t_cam_to_world = torch.tensor([-0.80, -2.3, 1.55], dtype=torch.float32, device=self.device) # 뒷 테이프 - 0.73 
+        # Camera -> world pose: only from sensing_node's /hrc/camera_pose (IMU roll/pitch +
+        # camera_pose.yaml yaw/t, transient_local). Nothing is computed until it arrives.
+        # (cam_R, t) are kept in one tuple so a frame never mixes old R with new t.
+        self._cam_pose = None
+        self.camera_pose_source = None
+        self.camera_pose_from_topic = False
+        self.get_logger().warn(
+            f"[camera pose] waiting for {CAMERA_POSE_TOPIC}; effective mass is not computed until it arrives"
+        )
+        self.camera_pose_sub = self.create_subscription(
+            String, CAMERA_POSE_TOPIC, self.camera_pose_callback, camera_pose_qos()
+        )
         self.euler_keep_idx = torch.tensor([i for i in range(22) if i not in (9, 10)], device=self.device)
         self.idx_smpl_ordered = [0, 1, 2, 3, 4, 5, 7, 8, 6, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
         self.idx_smpl_ordered_torch = torch.tensor(
@@ -138,6 +151,10 @@ class DynamicsNode(Node):
         self.rest_joints_19 = None
         self.rest_joint_offsets_19 = None
         self.com_local_offsets_19 = None
+        # Rest-pose pelvis J0 (SMPL-H, current betas) for the camera -> world correction in
+        # aa2euler; recomputed whenever the betas change (see _rest_pelvis_current).
+        self.rest_pelvis_cur = None
+        self.rest_pelvis_betas = None
         self.first_cal_inertia_mass =True
         self.has_new_pose =False
 
@@ -151,7 +168,7 @@ class DynamicsNode(Node):
         self.find_worst_num_directions = 64
         self.find_worst_target_index = 12
         try:
-            config_path = "/home/robotics/hrc_ws/src/hrc_body_tracking/server/renat.yaml"
+            config_path = ws("src/hrc_body_tracking/server/renat.yaml")
             with open(config_path, "r") as f:
                 vis_cfg = yaml.safe_load(f)["aggregate"]["vis_pose"]
             self.find_worst_vis_enabled = bool(
@@ -194,7 +211,7 @@ class DynamicsNode(Node):
             17: [20, 22],  # L_wrist + L_hand
             18: [21, 23],  # R_wrist + R_hand
         }
-        self.rom_cfg = load_rom_config_19(json_path="/home/robotics/python/physpt/models/joint_ROM.json")
+        self.rom_cfg = load_rom_config_19(json_path=ws("src/body_models/joint_rom/joint_ROM.json"))
 
         self.enable_meff_query_debug = self.declare_parameter(
             "enable_meff_query_debug",
@@ -202,7 +219,7 @@ class DynamicsNode(Node):
         ).value
         self.meff_query_debug_path = None
         if self.enable_meff_query_debug:
-            meff_debug_dir = "/home/robotics/hrc_ws/debug_log"
+            meff_debug_dir = ws("debug_log")
             os.makedirs(meff_debug_dir, exist_ok=True)
             self.meff_query_debug_path = os.path.join(
                 meff_debug_dir,
@@ -213,8 +230,7 @@ class DynamicsNode(Node):
                 f"{self.meff_query_debug_path}"
             )
         self.perf_update_logger = PerfCsvLogger(
-            "/home/robotics/hrc_ws/analysis/realtime_perf/"
-            "paper_human_dynamics_perf.csv",
+            ws("analysis/realtime_perf", "paper_human_dynamics_perf.csv"),
             [
                 "t_ros_sec",
                 "rotation_conversion_ms",
@@ -231,8 +247,7 @@ class DynamicsNode(Node):
             flush_every=30,
         )
         self.perf_query_logger = PerfCsvLogger(
-            "/home/robotics/hrc_ws/analysis/realtime_perf/"
-            "paper_human_meff_query_perf.csv",
+            ws("analysis/realtime_perf", "paper_human_meff_query_perf.csv"),
             [
                 "t_ros_sec",
                 "query_id",
@@ -244,8 +259,7 @@ class DynamicsNode(Node):
         )
 
     def _get_body_part_name(self, target_index: int) -> str:
-        if target_index == 15:
-            return "left_upper_arm"
+        # 15 = left_lower_arm, same part as sensing_node ("Left Lower Arm") and the robot side
         if 0 <= target_index < len(self.body_part_names):
             return self.body_part_names[target_index]
         return "invalid"
@@ -296,6 +310,14 @@ class DynamicsNode(Node):
 
     @torch.inference_mode()
     def timer_callback(self):
+
+        if self._cam_pose is None:
+            self.get_logger().warn(
+                f"[camera pose] still waiting for {CAMERA_POSE_TOPIC} (sensing_node publishes it after "
+                f"the IMU measurement); effective mass not computed",
+                throttle_duration_sec=5.0,
+            )
+            return
 
         if not self.has_new_pose:
             return 
@@ -455,7 +477,7 @@ class DynamicsNode(Node):
                     j_eval=self.find_worst_target_index,
                     num_directions=self.find_worst_num_directions,
                     tol_deg=5.0,
-                    meff_offset=2.0,
+                    meff_offset=0.0,
                 )
             )
 
@@ -488,6 +510,26 @@ class DynamicsNode(Node):
             self.get_logger().warn(f"Failed to publish worst M_eff direction: {e}")
 
    
+
+    def _make_cam_pose(self, roll_deg, pitch_deg, yaw_deg, t):
+        """(cam_R [1,3,3] float32, t [3] float32) on self.device."""
+        cam_R = camera_to_world_rotmat(roll=roll_deg, pitch=pitch_deg, yaw=yaw_deg, device=self.device).to(dtype=torch.float32).unsqueeze(0)
+        t_cam_to_world = torch.tensor([float(v) for v in t], dtype=torch.float32, device=self.device)
+        return cam_R, t_cam_to_world
+
+    def camera_pose_callback(self, msg: String):
+        try:
+            roll, pitch, yaw, t, source, _ = parse_pose_message(msg.data)
+        except Exception as e:
+            self.get_logger().error(f"[camera pose] bad {CAMERA_POSE_TOPIC} message ignored: {e}")
+            return
+        self._cam_pose = self._make_cam_pose(roll, pitch, yaw, t)
+        self.camera_pose_from_topic = True
+        self.camera_pose_source = f"{CAMERA_POSE_TOPIC} ({source})"
+        self.get_logger().info(
+            f"[camera pose] received {CAMERA_POSE_TOPIC}: roll {roll:.4f}, pitch {pitch:.4f}, "
+            f"yaw {yaw:.4f}, t {t} -- source: {source}"
+        )
 
     def calculate_vel(self):
         q_trans_dot = (self.q[:,:3] - self.previous_q[:,:3]) / constants.dt
@@ -573,6 +615,14 @@ class DynamicsNode(Node):
         trans : 1, 3 
         """
 
+    def _rest_pelvis_current(self):
+        """SMPL-H rest-pose pelvis J0 [1,3] for the current betas (recomputed when the betas change)."""
+        if self.rest_pelvis_betas is None or not torch.equal(self.rest_pelvis_betas, self.betas):
+            v_shaped = torch.tensordot(self.betas, self.smplh.shapedirs, dims=([1], [0])) + self.smplh.v_template.unsqueeze(0)
+            self.rest_pelvis_cur = torch.matmul(v_shaped.transpose(1, 2), self.smplh.regressor[:, :1]).transpose(1, 2)[:, 0]
+            self.rest_pelvis_betas = self.betas.clone()
+        return self.rest_pelvis_cur
+
     def aa2euler(self):
         "비실시간에서 AMASS_from_k4a.py 역할을 해야 함"
         "sensing_node.py 에서 카메라 좌표계로 저장된 pose 값을 world 기준으로 변환 "
@@ -584,15 +634,23 @@ class DynamicsNode(Node):
         
         '좌표계 변환 '
         # 카메라 좌표계 -> world 좌표계
-        # cam_R = camera_to_world_rotmat(roll=90,pitch= 0,yaw= 0,device=self.device).unsqueeze(0)
-        # t_cam_to_world = torch.tensor([-0.4, -3.4, 1.55], dtype=torch.float32, device=self.device) # world 기준 카메라의 위치
-        cam_R = self.cam_R
-        t_cam_to_world = self.t_cam_to_world
+        cam_R, t_cam_to_world = self._cam_pose
 
         # root rotation만 world 기준으로 변환
         rotmat_world = rotmat.clone()
         rotmat_world[:, 0] = cam_R.transpose(1, 2) @ rotmat_world[:, 0]
-        trans_torch_world = torch.bmm(cam_R.transpose(1,2), self.trans_torch_camera.unsqueeze(-1)).squeeze(-1) + t_cam_to_world
+        # SMPL rotates the body about the rest pelvis J0: pelvis_cam = J0 + trans_cam. Rotating only
+        # global_orient/transl would leave (I - A) J0 (A = cam_R^T) in every world position, so the
+        # pelvis is moved as a point instead: pelvis_world = A (J0 + trans_cam) + t, i.e.
+        # trans_world = A (trans_cam + J0) + t - J0_rest  (= previous value - (I - A) J0 for one body).
+        # J0_rest is the pelvis rigid_fk_19 starts from; t is then the real camera position.
+        J0_cur = self._rest_pelvis_current()
+        J0_rest = self.rest_joints_19[:, 0] if self.rest_joints_19 is not None else J0_cur
+        trans_torch_world = (
+            torch.bmm(cam_R.transpose(1, 2), (self.trans_torch_camera + J0_cur).unsqueeze(-1)).squeeze(-1)
+            + t_cam_to_world
+            - J0_rest
+        )
         
       
         'axis angle - > euler'
@@ -697,7 +755,11 @@ class DynamicsNode(Node):
 
         snapshot = self.latest_meff_snapshot
         if snapshot is None:
-            self.get_logger().warn("Directional meff query received before dynamics snapshot is ready")
+            self.get_logger().warn(
+                "Directional meff query received before dynamics snapshot is ready "
+                "(camera pose not received yet or no pose processed)",
+                throttle_duration_sec=5.0,
+            )
             return
 
         target_index = int(msg.target_index)
@@ -741,7 +803,6 @@ class DynamicsNode(Node):
                 tol_deg=5.0,
                 return_debug=False,
             )
-            meff_target +=2
 
             meff_value = float(meff_target.reshape(-1)[0].item())
 

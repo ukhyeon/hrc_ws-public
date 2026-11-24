@@ -1,0 +1,11 @@
+# Camera pose for hrc_body_tracking (camera -> world).
+#   cam_R   = Rx(roll) @ Ry(pitch) @ Rz(yaw)      (utils.camera_to_world_rotmat)
+#   p_world = cam_R.T @ p_color + t               (color-camera frame -> world, world z up, metres)
+#
+# roll·pitch는 sensing 시작 시 IMU로 측정 (이 파일에는 두지 않음).
+# t는 줄자로 잰 실제 카메라 위치 (world, 원점 = 로봇 베이스 중심 아래 바닥, 바닥 z = 0).
+# SMPL 골반 기준점(J0) 보정은 human_dynamics_node.aa2euler 계산식에서 한다 (t에 섞지 않음).
+# yaw·t는 바닥 표시 측정으로 검증하지 않은 임시값이다 (2026-11-18).
+# 검증: tools/camera_pose_fit.py (record -> fit, touch).
+yaw_deg: 0.0
+t: [-0.83, -2.10, 1.66]

@@ -1,5 +1,5 @@
-data_dirpath: "/home/robotics/realtime_smpl"
-output_dirpath: "/home/robotics/realtime_smpl/output_dir"
+data_dirpath: "${REALTIME_SMPL_DIR}"
+output_dirpath: "${REALTIME_SMPL_DIR}/output_dir"
 enable_filter: True
 
 aggregate:  # aggregate results from body, hand and face blocks

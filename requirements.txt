@@ -1,0 +1,35 @@
+# Python packages needed to RUN sensing_start and human_dynamics (hrc_ws + realtime_smpl).
+# Pinned to the versions on the reference PC (Ubuntu 22.04, RTX 2080 Ti, 2026-11-18).
+# Collected by instantiating both nodes and the lazily-built models (Inferer, Filterer,
+# SMPL/SMPL-X wrappers, mesh visualizer) and mapping every loaded module to its distribution.
+#
+# torch / torchvision are NOT in this file: pick the file for your CUDA toolkit (SETUP.md 6.1)
+#   requirements-torch-cu124.txt  reference PC (CUDA toolkit 12.4)
+#   requirements-torch-cu118.txt  CUDA toolkit 11.8 (nvcc must match torch for minimal_pytorch_rasterizer)
+#
+#   python3 -m pip install --no-cache-dir -r requirements-torch-cu124.txt -r requirements.txt
+#
+# NOT here on purpose:
+#   - cv2: OpenCV 4.2.0 + contrib built from source into /usr/local (SETUP.md 3.1).
+#     Do not pip-install opencv-python / opencv-contrib-python.
+#   - PyYAML, psutil, lark, lxml, pydot: Ubuntu python3-* packages used by ROS 2.
+#   - realtime_smpl/extern packages (smplx_kinect, smplx_optimization, patched_smplx,
+#     pyk4a, minimal_pytorch_rasterizer): installed from source (SETUP.md 5.2).
+#   - ROS 2 Python packages (rclpy, cv_bridge, message packages).
+
+numpy==1.26.4            # must stay < 2 (SETUP.md 5.1)
+scipy==1.15.3
+matplotlib==3.5.3
+Pillow==9.5.0
+kornia==0.3.0
+smplx==0.1.28
+chumpy==0.70             # SMPL .pkl unpickling; see SETUP.md 5.1 (numpy >= 1.24 compatibility)
+torchgeometry==0.1.2     # install_requires of patched_smplx
+trimesh==3.23.5
+pyrender==0.1.39
+PyOpenGL==3.1.0
+imageio==2.37.2
+freetype-py==2.5.1
+nvidia-ml-py3==7.352.0
+yacs==0.1.8
+tqdm==4.67.1

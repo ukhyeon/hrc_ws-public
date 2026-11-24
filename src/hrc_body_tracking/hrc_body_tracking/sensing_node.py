@@ -56,6 +56,17 @@ from collections import OrderedDict
 from hrc_body_tracking.models.cliff_hr48.cliff import CLIFF 
 from pathlib import Path
 from .cliff_img_processor import Img_Processor
+from .paths import ws, expand
+from std_msgs.msg import String
+from . import imu_k4a
+from .camera_pose import (
+    CAMERA_POSE_TOPIC, camera_pose_file, camera_pose_qos, load_camera_pose,
+    pose_message_data, write_measurement_log,
+)
+
+
+class CameraPoseInitError(SystemExit):
+    """IMU camera-pose measurement failed: stop the node (not caught by `except Exception`)."""
 
 
 # CLIFF 
@@ -319,9 +330,11 @@ class HRCSensingNode(Node):
 
         self.bridge = CvBridge()
 
-        CONFIG_PATH = "/home/robotics/hrc_ws/src/hrc_body_tracking/server/renat.yaml"
+        CONFIG_PATH = ws("src/hrc_body_tracking/server/renat.yaml")
         with open(CONFIG_PATH, 'r') as f:
             config = yaml.safe_load(f)
+        config['data_dirpath'] = expand(config['data_dirpath'])
+        config['output_dirpath'] = expand(config['output_dirpath'])
         self.k4a_processor_config=config['k4a']
         self.body_processor_config = config['body_pose']
         self.aggregate_vis_processor_config = config['aggregate']['vis_pose']
@@ -329,7 +342,7 @@ class HRCSensingNode(Node):
         self.pykinect_data_dp = osp.join(config['data_dirpath'], 'pykinect') # pykinect
         self.aggregate_filterer_processor_config['body_models_dp'] = osp.join(self.pykinect_data_dp, 'body_models')
         self.data_dir = config['data_dirpath']
-        self.pose_npz_dir = '/home/robotics/hrc_ws/pose_npz'
+        self.pose_npz_dir = ws('pose_npz')
         self.enable_filter = config['enable_filter']
     
 
@@ -426,7 +439,8 @@ class HRCSensingNode(Node):
             17: 20,
             18: 21,
         }
-        self.iso_json_path = "/home/robotics/indy_ws/src/indy_control_cpp/ISO15066/iso_15066.json"
+        # copy of indy_ws/src/indy_control_cpp/ISO15066/iso_15066.json (indy_ws is not a dependency)
+        self.iso_json_path = ws("src/hrc_body_tracking/server/iso_15066.json")
         self.iso_fixed_mass_by_body_name = self._load_iso_fixed_mass_map(
             self.iso_json_path
         )
@@ -443,15 +457,17 @@ class HRCSensingNode(Node):
         )
         # radius
         self.activation_sphere_radius = 1.3 
-        self.camera_rotation = camera_to_world_rotmat(
-            roll=110.8,
-            pitch=0.0,
-            yaw=0.0,
-            device="cpu",
-        ).cpu().numpy()
-        self.camera_position_world = np.array(
-            [-0.80, -2.3, 1.55],
-            dtype=np.float32,
+        # Camera -> world pose. roll/pitch: Kinect IMU, measured once right after
+        # k4a.connect() (_init_camera_pose_from_imu); the node stops if that fails.
+        # yaw/t: camera_pose.yaml.
+        self.camera_pose_path = camera_pose_file()
+        self.camera_pose_cfg = load_camera_pose(self.camera_pose_path)
+        self.camera_pose_initialized = False
+        self.camera_pose_values = None
+        self.camera_rotation = None  # set from the IMU before the capture loop
+        self.camera_position_world = np.array(self.camera_pose_cfg["t"], dtype=np.float32)
+        self.camera_pose_pub = self.create_publisher(
+            String, CAMERA_POSE_TOPIC, camera_pose_qos()
         )
         self.activation_sphere_projection = None
         self.smplx_wrapper = None
@@ -460,7 +476,7 @@ class HRCSensingNode(Node):
         self.smpl_visualizer = None
         self.vis_smplx = None
         self.vis_smpl = None
-        self.vis_dp = "/home/robotics/hrc_ws/vis_output"
+        self.vis_dp = ws("vis_output")
         if self.visualization_enabled:
             os.makedirs(self.vis_dp, exist_ok=True)
 
@@ -513,8 +529,7 @@ class HRCSensingNode(Node):
         self.has_person_in_frame = False
         self.has_person_lock = threading.Lock()
         self.perf_logger = PerfCsvLogger(
-            "/home/robotics/hrc_ws/analysis/realtime_perf/"
-            "paper_human_sensing_perf.csv",
+            ws("analysis/realtime_perf", "paper_human_sensing_perf.csv"),
             [
                 "t_ros_sec",
                 "frame_index",
@@ -674,6 +689,9 @@ class HRCSensingNode(Node):
                     gpu_id=self.gpu_id  # 0
                 ))
                 k4a.connect(lut=True)
+                # once, before the capture loop: IMU gravity -> roll/pitch (uses pyk4a's handle)
+                if not self.camera_pose_initialized:
+                    self._init_camera_pose_from_imu(k4a)
                 self.decoded_cam_params = cam_params_decode(k4a.get_cam_params())
                 if self.show_activation_sphere:
                     self.activation_sphere_projection = project_sphere_wireframe(
@@ -839,7 +857,7 @@ class HRCSensingNode(Node):
                     self.get_logger().info(f" is_ready_shape : {self.is_ready_shape}")
 
                     if body_crop_vis_debug is not None:
-                        save_dir = "/home/robotics/hrc_ws/body_crop"
+                        save_dir = ws("body_crop")
                         os.makedirs(save_dir, exist_ok= True)
                         save_path = os.path.join(save_dir, f"body_crop_{self.index}.jpg")
                         cv2.imwrite(save_path, body_crop_vis_debug)
@@ -1202,6 +1220,87 @@ class HRCSensingNode(Node):
         except Exception as e:
             self.get_logger().error(f"Processing Error: {e}")
 
+    def _apply_camera_pose(self, roll_deg, pitch_deg, yaw_deg, t):
+        """Set camera_rotation / camera_position_world."""
+        self.camera_pose_values = (float(roll_deg), float(pitch_deg), float(yaw_deg),
+                                   [float(v) for v in t])
+        self.camera_rotation = camera_to_world_rotmat(
+            roll=float(roll_deg),
+            pitch=float(pitch_deg),
+            yaw=float(yaw_deg),
+            device="cpu",
+        ).cpu().numpy()
+        self.camera_position_world = np.array(
+            [float(v) for v in t],
+            dtype=np.float32,
+        )
+
+    def _init_camera_pose_from_imu(self, k4a=None):
+        """Measure roll/pitch from the Kinect IMU once and publish the camera pose.
+
+        Uses the device handle pyk4a's k4a_module already opened (no second open) and the
+        same libk4a instance. If there is no handle, the device calls fail, or the check
+        (|g| = 9.81 +/- 0.3, camera still) does not pass, the reason is logged and the node
+        stops (CameraPoseInitError). On success: roll/pitch + camera_pose.yaml yaw/t are
+        published on /hrc/camera_pose and the measurement is written to debug_log/.
+        """
+        log = self.get_logger()
+        yaw, t = self.camera_pose_cfg["yaw_deg"], self.camera_pose_cfg["t"]
+        record = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "accepted": False,
+                  "yaw_deg": yaw, "t": t, "camera_pose_yaml": self.camera_pose_path}
+
+        def fail(reason):
+            record["reason"] = reason
+            try:
+                log.info(f"[camera pose] measurement log: {write_measurement_log(record)}")
+            except Exception as e:
+                log.warn(f"[camera pose] could not write measurement log: {e}")
+            log.fatal(f"[camera pose] IMU camera pose failed: {reason} -- stopping sensing node "
+                      f"(fix the camera/IMU and restart; roll/pitch have no fallback)")
+            if k4a is not None:
+                self.k4a = k4a  # so destroy_node() disconnects the camera
+            raise CameraPoseInitError(1)
+
+        try:
+            lib = imu_k4a.load_lib()
+            handle = imu_k4a.pyk4a_device_handle()
+            if not handle.value:
+                fail("pyk4a device handle is NULL (k4a_module 'device' not open)")
+            libs = imu_k4a.libk4a_mappings()
+            record["libk4a_mapped"] = libs
+            log.info(f"[camera pose] libk4a mapped in this process: {len(libs)} {libs}")
+            m = imu_k4a.measure_roll_pitch_with_handle(lib, handle, seconds=2.0, skip_s=0.3)
+        except CameraPoseInitError:
+            raise
+        except Exception as e:
+            fail(f"IMU read error: {e}")
+
+        record.update({k: m[k] for k in ("g_norm_mps2", "accel_std_max_mps2", "gyro_std_max_radps",
+                                         "samples", "temperature_c", "down_sign_flipped")})
+        record["roll_deg"] = round(float(m["roll_deg"]), 4)
+        record["pitch_deg"] = round(float(m["pitch_deg"]), 4)
+        record["down_color"] = [round(float(v), 6) for v in m["down_color"]]
+        if not m["ok"]:
+            fail("measurement rejected: " + "; ".join(m["reasons"]))
+
+        roll, pitch = record["roll_deg"], record["pitch_deg"]
+        record["accepted"] = True
+        try:
+            log.info(f"[camera pose] measurement log: {write_measurement_log(record)}")
+        except Exception as e:
+            log.warn(f"[camera pose] could not write measurement log: {e}")
+
+        self._apply_camera_pose(roll, pitch, yaw, t)
+        self.camera_pose_initialized = True
+        extra = {k: record[k] for k in ("g_norm_mps2", "accel_std_max_mps2", "gyro_std_max_radps", "samples")}
+        log.info(
+            f"[camera pose] roll {roll:.4f} deg, pitch {pitch:.4f} deg (IMU, |g| {extra['g_norm_mps2']}, "
+            f"n {extra['samples']}); yaw {yaw:.4f} deg, t {t} (camera_pose.yaml)"
+        )
+        msg = String()
+        msg.data = pose_message_data(roll, pitch, yaw, t, "imu", **extra)
+        self.camera_pose_pub.publish(msg)
+
     def state_callback(self, msg:HumanState):
 
         effective_mass = np.array(msg.effmass, dtype=np.float32)
@@ -1309,7 +1408,7 @@ class HRCSensingNode(Node):
 
     def _get_body_part_name(self, target_index: int) -> str:
         if target_index == 15:
-            return "Left Upper Arm"
+            return "Left Lower Arm"
         if 0 <= target_index < len(self.body_part_names):
             return self.body_part_names[target_index]
         return f"index_{target_index}"
@@ -1329,16 +1428,35 @@ class HRCSensingNode(Node):
             self.get_logger().warn(f"Failed to load ISO fixed-mass table: {e}")
             return {}
 
+    # target index (19-part order) -> key in iso_15066.json. Identical to the robot side
+    # (indy_ws collision_assessment_node human_index_to_part_name_), so sensing displays the
+    # same ISO value the robot uses for its ISO comparison.
+    ISO_KEY_BY_TARGET = {
+        0: "pelvis", 1: "left_thigh", 2: "right_thigh", 3: "abdomen",
+        4: "left_calf", 5: "right_calf", 6: "left_foot", 7: "right_foot",
+        8: "chest", 9: "neck", 10: "left_shoulder", 11: "right_shoulder", 12: "head",
+        13: "left_upper_arm", 14: "right_upper_arm", 15: "left_lower_arm", 16: "right_lower_arm",
+        17: "left_hand", 18: "right_hand",
+    }
+    # Feet have no entry in the ISO table and are never collision targets on the robot side
+    # (isValidHumanCollisionIndex excludes 6 and 7): fixed fallback without a warning.
+    ISO_KEYS_WITHOUT_ENTRY = {"left_foot", "right_foot"}
+    ISO_FALLBACK_MASS_KG = 4.4
+
     def get_iso_fixed_mass(self, target_index: int) -> float:
-        if target_index == 15:
-            return 3.0
-        body_name = self._get_body_part_name(target_index)
-        if body_name in self.iso_fixed_mass_by_body_name:
-            return float(self.iso_fixed_mass_by_body_name[body_name])
+        target_index = int(target_index)
+        key = self.ISO_KEY_BY_TARGET.get(target_index)
+        if key in self.ISO_KEYS_WITHOUT_ENTRY:
+            return self.ISO_FALLBACK_MASS_KG  # feet: not an ISO region, never a collision target
+        if key is not None and key in self.iso_fixed_mass_by_body_name:
+            return float(self.iso_fixed_mass_by_body_name[key])
         self.get_logger().warn(
-            f"ISO fixed mass not found for body part '{body_name}', falling back to 4.4 kg"
+            f"ISO fixed mass not found for target {target_index} "
+            f"('{self._get_body_part_name(target_index)}', key {key!r}), "
+            f"falling back to {self.ISO_FALLBACK_MASS_KG} kg",
+            throttle_duration_sec=10.0,
         )
-        return 4.4
+        return self.ISO_FALLBACK_MASS_KG
 
     def draw_worst_target_text_overlay(self, vis, worst_target_meff):
         if worst_target_meff is None:

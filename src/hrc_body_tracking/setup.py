@@ -23,8 +23,8 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='robotics',
-    maintainer_email='treyu1231@naver.com',
+    maintainer='ukhyeon',
+    maintainer_email='169152093+ukhyeon@users.noreply.github.com',
     description='Human sensing and dynamics estimation for human-robot collaboration',
     license='Apache-2.0 AND MIT',
     extras_require={

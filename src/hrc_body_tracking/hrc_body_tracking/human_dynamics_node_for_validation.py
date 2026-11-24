@@ -18,6 +18,7 @@ import json
 from .utils import batch_rodrigues, rotmat2euleryzx,rotmat2eulerzxy,rotmat2eulerzyx, batch_roteulerSMPL, wrap_to_pi_torch, load_rom_config_19, camera_to_world_rotmat
 from. import constants
 from .physcis import Physics, SMPL,SMPLH
+from .paths import ws
 
 
 class DynamicsNode(Node):
@@ -152,10 +153,10 @@ class DynamicsNode(Node):
             17: [20, 22],  # L_wrist + L_hand
             18: [21, 23],  # R_wrist + R_hand
         }
-        self.rom_cfg = load_rom_config_19(json_path="/home/robotics/python/physpt/models/joint_ROM.json")
+        self.rom_cfg = load_rom_config_19(json_path=ws("src/body_models/joint_rom/joint_ROM.json"))
 
         # Directional effective mass query debug log
-        self.meff_debug_dir = "/home/robotics/hrc_ws/debug_log"
+        self.meff_debug_dir = ws("debug_log")
         os.makedirs(self.meff_debug_dir, exist_ok=True)
 
         self.meff_query_debug_path = os.path.join(

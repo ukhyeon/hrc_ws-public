@@ -1,0 +1,170 @@
+{
+  "rom_limits": {
+    "upper_cervical": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 15,
+      "reduced_smpl_joint_index":12 , 
+      "label_en": "upper_cervical",
+      "euler_xyz": {
+        "x": { "min_deg": -41.1, "max_deg": 26.4 },
+        "y": { "min_deg": -56.1, "max_deg": 56.1 },
+        "z": { "min_deg": -20.4, "max_deg": 20.4 }
+      }
+    },
+    "lower_cervical": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 12,
+      "reduced_smpl_joint_index":9 , 
+      "label_en": "lower_cervical",
+      "euler_xyz": {
+        "x": { "min_deg": -21.9, "max_deg": 37.6 },
+        "y": { "min_deg": -28.9, "max_deg": 28.9 },
+        "z": { "min_deg": -28.6, "max_deg": 28.6 }
+      }
+    },
+    "thoracic": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 6,
+      "reduced_smpl_joint_index":8 , 
+      "label_en": "thoracic",
+      "euler_xyz": {
+        "x": { "min_deg": -22.0, "max_deg": 26.0 },
+        "y": { "min_deg": -47.0, "max_deg": 47.0 },
+        "z": { "min_deg": -30.0, "max_deg": 30.0 }
+      }
+    },
+    "lumbar": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 3,
+      "reduced_smpl_joint_index":3, 
+      "label_en": "lumbar",
+      "euler_xyz": {
+        "x": { "min_deg": -31.0, "max_deg": 65.0 },
+        "y": { "min_deg": -15.3, "max_deg": 15.3 },
+        "z": { "min_deg": -30.0, "max_deg": 30.0 }
+      }
+    },
+    "left_shoulder": {
+      "constraint_type": "combined_sum_limit",
+      "smpl_joint_indices": [13, 16],
+      "reduced_smpl_joint_index":13 , 
+      "label_en": "left_shoulder",
+      "description": "sum of two shoulder joint angles",
+      "euler_xyz": {
+        "x": { "min_deg": -125.0, "max_deg": 90.0 },
+        "y": { "min_deg": -120.0, "max_deg": 5.0 },
+        "z": { "min_deg": -90.0, "max_deg": 90.0 }
+      }
+    },
+    "right_shoulder": {
+      "constraint_type": "combined_sum_limit",
+      "smpl_joint_indices": [14, 17],
+      "reduced_smpl_joint_index":14 , 
+      "label_en": "right_shoulder",
+      "description": "sum of two shoulder joint angles",
+      "euler_xyz": {
+        "x": { "min_deg": -90.0, "max_deg": 125.0 },
+        "y": { "min_deg": -5.0, "max_deg": 120.0 },
+        "z": { "min_deg": -90.0, "max_deg": 90.0 }
+      }
+    },
+    "left_elbow": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 18,
+      "reduced_smpl_joint_index":15, 
+      "label_en": "left_elbow",
+      "euler_xyz": {
+        "y": { "min_deg": -130.0, "max_deg": 3.0 }
+      }
+    },
+    "right_elbow": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 19,
+      "reduced_smpl_joint_index":16, 
+      "label_en": "right_elbow",
+      "euler_xyz": {
+        "y": { "min_deg": -3.0, "max_deg": 130.0 }
+      }
+    },
+    "left_wrist": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 20,
+      "reduced_smpl_joint_index":17 , 
+      "label_en": "left_wrist",
+      "euler_xyz": {
+        "y": { "min_deg": -25.0, "max_deg": 10.0 },
+        "z": { "min_deg": -70.0, "max_deg": 70.0 }
+      }
+    },
+    "right_wrist": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 21,
+      "reduced_smpl_joint_index":18 , 
+      "label_en": "right_wrist",
+      "euler_xyz": {
+        "y": { "min_deg": -10.0, "max_deg": 25.0 },
+        "z": { "min_deg": -70.0, "max_deg": 70.0 }
+      }
+    },
+    "left_hip": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 1,
+      "reduced_smpl_joint_index":1, 
+      "label_en": "left_hip",
+      "euler_xyz": {
+        "x": { "min_deg": -90.0, "max_deg": 30.0 },
+        "y": { "min_deg": -40.0, "max_deg": 40.0 },
+        "z": { "min_deg": -30.0, "max_deg": 50.0 }
+      }
+    },
+    "right_hip": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 2,
+      "reduced_smpl_joint_index":2, 
+      "label_en": "right_hip",
+      "euler_xyz": {
+        "x": { "min_deg": -90.0, "max_deg": 30.0 },
+        "y": { "min_deg": -40.0, "max_deg": 40.0 },
+        "z": { "min_deg": -50.0, "max_deg": 30.0 }
+      }
+    },
+    "left_knee": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 4,
+      "reduced_smpl_joint_index":4, 
+      "label_en": "left_knee",
+      "euler_xyz": {
+        "x": { "min_deg": 0.0, "max_deg": 120.0 }
+      }
+    },
+    "right_knee": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 5,
+      "reduced_smpl_joint_index":5, 
+      "label_en": "right_knee",
+      "euler_xyz": {
+        "x": { "min_deg": 0.0, "max_deg": 120.0 }
+      }
+    },
+    "left_ankle": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 7,
+      "reduced_smpl_joint_index":6, 
+      "label_en": "left_ankle",
+      "euler_xyz": {
+        "x": { "min_deg": -40.0, "max_deg": 30.0 },
+        "y": { "min_deg": -20.0, "max_deg": 20.0 }
+      }
+    },
+    "right_ankle": {
+      "constraint_type": "single_joint_limit",
+      "smpl_joint_index": 8,
+      "reduced_smpl_joint_index":7, 
+      "label_en": "right_ankle",
+      "euler_xyz": {
+        "x": { "min_deg": -40.0, "max_deg": 30.0 },
+        "y": { "min_deg": -20.0, "max_deg": 20.0 }
+      }
+    }
+  }
+}
